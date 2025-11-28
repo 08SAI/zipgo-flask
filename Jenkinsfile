@@ -2,10 +2,9 @@ pipeline {
   agent any
 
   environment {
-    IMAGE_TAG = "zipgo-svc:4"
+    IMAGE = "zipgo-svc:4"
     CONTAINER_NAME = "zipgo-svc-4"
-    HOST_PORT = "12184"
-    CONTAINER_PORT = "12184"
+    PORT = "12184"
   }
 
   stages {
@@ -18,109 +17,80 @@ pipeline {
     stage('Pre-check Docker') {
       steps {
         script {
-          if (isUnix()) {
-            // Unix/WSL: check docker CLI and daemon
-            if (sh(returnStatus: true, script: 'command -v docker >/dev/null 2>&1') != 0) {
-              error("Docker CLI not found on this agent (is docker installed / on PATH?).")
-            }
-            if (sh(returnStatus: true, script: 'docker info >/dev/null 2>&1') != 0) {
-              error("Docker daemon not responding on this agent (docker info failed).")
-            }
-          } else {
-            // Windows agent: try docker directly; if that fails, try bash (Git-for-Windows) as fallback
-            def direct = bat(returnStatus: true, script: 'docker --version >nul 2>&1')
-            if (direct == 0) {
-              def infoStatus = bat(returnStatus: true, script: 'docker info >nul 2>&1')
-              if (infoStatus != 0) {
-                error("Docker daemon not responding on Windows agent (docker info failed).")
-              }
-            } else {
-              // try Git-for-Windows bash which may provide docker in some setups or WSL integration
-              def bashTry = bat(returnStatus: true, script: 'bash -lc "command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1"')
-              if (bashTry != 0) {
-                error("Docker not available on this Windows agent. Tried 'docker' and 'bash -lc docker'.")
-              }
-            }
+          // run docker version and fail clearly if not available
+          def rc = sh(script: "docker info > /dev/null 2>&1 || echo NO_DOCKER", returnStdout: true).trim()
+          if (rc == "NO_DOCKER") {
+            error("Docker is not available on this agent. Ensure Docker daemon is installed and user running Jenkins has permission to use Docker.")
           }
+          // also print docker version for visibility
+          sh "docker --version"
+          sh "docker info --format '{{ json .ServerVersion }}' || true"
         }
       }
     }
 
-    stage('Build Docker Image') {
+    stage('Build image') {
       steps {
-        script {
-          if (isUnix()) {
-            sh "docker build -t ${IMAGE_TAG} ."
-          } else {
-            bat "docker build -t %IMAGE_TAG% ."
-          }
-        }
+        sh """
+          docker build -t ${IMAGE} .
+        """
       }
     }
 
     stage('Stop previous container (if any)') {
       steps {
         script {
-          if (isUnix()) {
-            sh "docker rm -f ${CONTAINER_NAME} >/dev/null 2>&1 || true"
-          } else {
-            bat 'docker rm -f %CONTAINER_NAME% >nul 2>&1 || exit 0'
-          }
+          sh """
+            if docker ps -a --format '{{.Names}}' | grep -q '^${CONTAINER_NAME}$' ; then
+              echo 'Stopping and removing existing container ${CONTAINER_NAME}'
+              docker rm -f ${CONTAINER_NAME} || true
+            else
+              echo 'No existing container ${CONTAINER_NAME} found.'
+            fi
+          """
         }
       }
     }
 
     stage('Run container') {
       steps {
-        script {
-          if (isUnix()) {
-            sh "docker run -d --name ${CONTAINER_NAME} -p ${HOST_PORT}:${CONTAINER_PORT} ${IMAGE_TAG}"
-          } else {
-            bat 'docker run -d --name %CONTAINER_NAME% -p %HOST_PORT%:%CONTAINER_PORT% %IMAGE_TAG%'
-          }
-        }
+        sh """
+          docker run -d --name ${CONTAINER_NAME} -p ${PORT}:12184 --restart unless-stopped ${IMAGE}
+        """
       }
     }
 
     stage('Smoke test') {
       steps {
-        script {
-          if (isUnix()) {
-            sh '''
-              sleep 2
-              curl -sS --max-time 5 http://localhost:${HOST_PORT}/ || (echo "SMOKE_FAIL" && exit 2)
-            '''
-          } else {
-            bat '''
-              timeout /t 2 /nobreak >nul
-              curl -sS --max-time 5 http://localhost:%HOST_PORT% || (echo SMOKE_FAIL & exit /b 2)
-            '''
-          }
-        }
+        // Wait a moment for server to come up, then curl
+        sh """
+          echo 'Waiting for service to start...'
+          for i in 1 2 3 4 5; do
+            sleep 1
+            if curl -s --max-time 2 http://127.0.0.1:${PORT}/ | grep -q 'ZipGo'; then
+              echo 'Smoke test passed'
+              exit 0
+            fi
+            echo 'Attempt ' $i ' - not up yet'
+          done
+          echo 'Service failed to respond on port ${PORT}'
+          docker logs ${CONTAINER_NAME} || true
+          exit 1
+        """
       }
     }
   }
 
   post {
-    success {
-      script {
-        echo "SUCCESS: ${env.IMAGE_TAG} running on port ${env.HOST_PORT}"
-      }
-    }
     failure {
-      script {
-        echo "FAILED - check prior logs for errors"
-      }
+      echo "Pipeline failed — gather container state and logs:"
+      sh "docker ps -a || true"
+      sh "docker images | grep zipgo-svc || true"
+      sh "docker logs ${CONTAINER_NAME} || true"
     }
-    always {
-      script {
-        // optional: print container listing for debugging evidence
-        if (isUnix()) {
-          sh 'docker ps --filter name=${CONTAINER_NAME} --format "table {{.ID}}\\t{{.Names}}\\t{{.Ports}}" || true'
-        } else {
-          bat 'docker ps --filter name=%CONTAINER_NAME% --format "table {{.ID}}\\t{{.Names}}\\t{{.Ports}}" || exit 0'
-        }
-      }
+    success {
+      echo "Pipeline completed successfully and container ${CONTAINER_NAME} is running on port ${PORT}"
+      sh "docker ps --filter name=${CONTAINER_NAME} --format 'table {{.ID}}\\t{{.Names}}\\t{{.Ports}}'"
     }
   }
 }
